@@ -93,6 +93,7 @@ a = Analysis(
         'core.wimp_analysis',
         'core.pdsi',
         'engine',
+        'runner',
         'gui',
         'config',
     ]+ s3fs_hiddenimports,

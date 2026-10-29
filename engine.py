@@ -21,6 +21,7 @@ class EventDispatcher:
 
     def __init__(self):
         self._handlers = {}  # message_type -> list of callbacks
+        self._error_listeners = []  # callbacks told when a handler raises
         self._message_queue = collections.deque()
         self._seen_hashes = set()
 
@@ -29,6 +30,11 @@ class EventDispatcher:
         if message_type not in self._handlers:
             self._handlers[message_type] = []
         self._handlers[message_type].append(callback)
+
+    def add_error_listener(self, callback):
+        """Register callback(error_msg) to be called when a handler raises.
+        error_msg has original_message, error and traceback keys."""
+        self._error_listeners.append(callback)
 
     def _get_caller_module(self) -> str:
         """Walk the stack and return the first module name outside this file."""
@@ -130,3 +136,8 @@ class EventDispatcher:
         }
         self._message_queue.clear()
         logger.error(error_msg)
+        for listener in self._error_listeners:
+            try:
+                listener(error_msg)
+            except Exception as e:
+                logger.error(f"Error listener failed: {e}", exc_info=True)

@@ -3,19 +3,27 @@
 APT GUI
 """
 
-import csv
 import os
 import tkinter as tk
-from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, ttk
 import webbrowser
 from config import get_base_url
+from runner import RunRequest, Runner, dates_from_csv, dates_from_range, parse_date
+
+# Scope menu label -> RunRequest.scope
+SCOPE_CODES = {
+    "Single Point": "point",
+    "HUC12": "huc12",
+    "HUC10": "huc10",
+    "HUC8": "huc8",
+    "Custom Polygon": "polygon",
+}
 
 
 class PrecipGUI:
-    def __init__(self, root, dispatcher, data_dir="data"):
+    def __init__(self, root, runner: Runner, data_dir="data"):
         self.root = root
-        self.dispatcher = dispatcher
+        self.runner = runner
         self.data_dir = data_dir
 
         self.root.title("Antecedent Precipitation Tool")
@@ -344,31 +352,13 @@ class PrecipGUI:
                 txt = entry.get().strip()
                 if not txt:
                     continue
-                dates.append(datetime.strptime(txt, "%Y-%m-%d"))
+                dates.append(parse_date(txt))
         elif self.date_mode == "range":
-            start = datetime.strptime(self.start_entry.get().strip(), "%Y-%m-%d")
-            end = datetime.strptime(self.end_entry.get().strip(), "%Y-%m-%d")
-            if end < start:
-                raise ValueError("End date must be on or after start date")
-            cur = start
-            while cur <= end:
-                dates.append(cur)
-                cur += timedelta(days=1)
+            dates = dates_from_range(
+                parse_date(self.start_entry.get()), parse_date(self.end_entry.get())
+            )
         else:  # csv
-            path = self.csv_entry.get().strip()
-            if not path or not os.path.isfile(path):
-                raise ValueError("Valid CSV file path required")
-            with open(path, newline="", encoding="utf-8-sig") as fh:
-                reader = csv.reader(fh)
-                for row in reader:
-                    for cell in row:
-                        cell = cell.strip()
-                        try:
-                            dates.append(datetime.strptime(cell, "%Y-%m-%d"))
-                            break
-                        except ValueError:
-                            continue
-            dates = sorted(set(dates))
+            dates = dates_from_csv(self.csv_entry.get().strip())
 
         if not dates:
             raise ValueError("No valid dates provided")
@@ -389,98 +379,40 @@ class PrecipGUI:
     # ------------------------------------------------------------------
     # Calculate
     # ------------------------------------------------------------------
+    def _build_request(self) -> RunRequest:
+        scope = SCOPE_CODES[self.scope_var.get()]
+        request = RunRequest(
+            lat=float(self.lat_entry.get().strip()),
+            lon=float(self.lon_entry.get().strip()),
+            dates=self._get_dates(),
+            scope=scope,
+            analysis_types=self._selected_analysis_types(),
+            gridded=self.gridded_var.get(),
+            output_dir="output",
+            data_dir=self.data_dir,
+        )
+        if scope == "polygon":
+            request.custom_polygon = self.custom_path_entry.get().strip() or None
+            request.custom_name = self.custom_name_entry.get().strip() or "CUSTOM"
+        request.validate()
+        return request
+
     def run_btn_clicked(self):
         try:
-            lat = float(self.lat_entry.get().strip())
-            lon = float(self.lon_entry.get().strip())
-            dates = self._get_dates()
-            analysis_types = self._selected_analysis_types()
-            scope = self.scope_var.get()
+            request = self._build_request()
 
             self.calc_btn.config(state="disabled")
             self.status_var.set("Processing")
             self.root.update_idletasks()
 
-            is_huc = scope in ("HUC12", "HUC10", "HUC8")
-            is_custom = scope == "Custom Polygon"
+            if request.is_area and len(request.dates) > 1:
+                messagebox.showinfo(
+                    "Note",
+                    "Watershed modes currently use the first date only.\n"
+                    "For multi-date watershed runs, use Single Point + date list/range.",
+                )
 
-            if is_huc or is_custom:
-                # HUC / custom currently single-date in the engine
-                if len(dates) > 1:
-                    messagebox.showinfo(
-                        "Note",
-                        "Watershed modes currently use the first date only.\n"
-                        "For multi-date watershed runs, use Single Point + date list/range.",
-                    )
-                analysis_date = dates[0]
-                huc_level = {"HUC12": 12, "HUC10": 10, "HUC8": 8}.get(scope, 8)
-
-                msg = {
-                    "message_type": "huc_analysis",
-                    "lat": lat,
-                    "lon": lon,
-                    "analysis_date": analysis_date,
-                    "output_dir": "output",
-                    "data_dir": self.data_dir,
-                    "huc_level": huc_level,
-                    "analysis_types": analysis_types,
-                }
-                if self.gridded_var.get():
-                    msg["gridded"] = True
-                if is_custom and self.custom_polygon_path:
-                    msg["custom_polygon"] = self.custom_polygon_path
-                    msg["custom_name"] = (
-                        self.custom_name_entry.get().strip() or "CUSTOM"
-                    )
-                self.dispatcher.notify(msg)
-            else:
-                # Single Point – full multi-date support
-                for current_date in dates:
-                    bulk = {
-                        "lat": lat,
-                        "lon": lon,
-                        "analysis_date": current_date,
-                        "output_dir": "output",
-                        "data_dir": self.data_dir,
-                    }
-                    if "precip" in analysis_types:
-                        msg = {"message_type": "precip_analysis", **bulk}
-                        if self.gridded_var.get():
-                            msg["gridded"] = True
-                        self.dispatcher.notify(msg)
-                    if "usgs" in analysis_types:
-                        self.dispatcher.notify(
-                            {"message_type": "usgs_analysis", **bulk}
-                        )
-                    if "nwm" in analysis_types:
-                        self.dispatcher.notify({"message_type": "nwm_analysis", **bulk})
-                    if "wimp" in analysis_types:
-                        self.dispatcher.notify(
-                            {"message_type": "wimp_analysis", **bulk}
-                        )
-                    if "pdsi" in analysis_types:
-                        self.dispatcher.notify(
-                            {"message_type": "pdsi_analysis", **bulk}
-                        )
-                    self.dispatcher.notify(
-                        {
-                            "message_type": "generate_pdf",
-                            "analysis_types": analysis_types,
-                            **bulk,
-                        }
-                    )
-
-                if len(dates) > 1:
-                    self.dispatcher.notify(
-                        {
-                            "message_type": "merge_pdfs",
-                            "lat": lat,
-                            "lon": lon,
-                            "start_date": dates[0],
-                            "end_date": dates[-1],
-                            "output_dir": "output",
-                        }
-                    )
+            self.runner.run(request)
 
         except ValueError as e:
             messagebox.showerror("Input Error", str(e))

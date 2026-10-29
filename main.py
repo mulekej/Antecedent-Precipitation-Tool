@@ -18,6 +18,7 @@ os.environ["MPLCONFIGDIR"] = os.path.join(base_dir, "mpl_cache")
 
 # App-specific imports
 from engine import EventDispatcher
+from runner import Runner
 from gui import PrecipGUI
 from config import load_manifest, find_data_dir
 from adapters.precip_adapter import PrecipAdapter
@@ -77,6 +78,7 @@ def setup_logging():
     local_modules = [
         "__main__",
         "engine",
+        "runner",
         "gui",
         "core.precip_downloader",
         "core.gridded_downloader",
@@ -117,8 +119,9 @@ if __name__ == "__main__":
     WimpAdapter().register_handlers(dispatcher)
     PdsiAdapter().register_handlers(dispatcher)
     AreaAdapter().register_handlers(dispatcher)
+    runner = Runner(dispatcher)
 
     # 4. Start GUI
     root = tk.Tk()
-    app = PrecipGUI(root, dispatcher, data_dir=data_dir)
+    app = PrecipGUI(root, runner, data_dir=data_dir)
     root.mainloop()
