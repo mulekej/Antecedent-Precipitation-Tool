@@ -18,3 +18,4 @@
 *.kml
 *.lprof
 .scannerwork/
+.idea/
