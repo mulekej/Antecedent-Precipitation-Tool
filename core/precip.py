@@ -8,6 +8,9 @@ from core.precip_downloader import build_composite_precip_series
 
 logger = logging.getLogger(__name__)
 
+# Minimum years of complete 30-day totals required to report a normal for a day
+MIN_NORMAL_YEARS = 20
+
 
 def value_list_to_water_year_table(
     dates: pd.DatetimeIndex, values: pd.Series
@@ -50,9 +53,20 @@ def calc_normal_values(dates: pd.DatetimeIndex, values_array: np.ndarray):
     if values_array.size == 0:
         return pd.Series(dtype="float64"), pd.Series(dtype="float64")
 
+    # Years with missing data are excluded per day rather than counted as zero
     daily_values = values_array.T
-    normal_low = np.percentile(daily_values, 30, axis=1)
-    normal_high = np.percentile(daily_values, 70, axis=1)
+    years_present = np.sum(~np.isnan(daily_values), axis=1)
+    with np.errstate(all="ignore"):
+        normal_low = np.nanpercentile(daily_values, 30, axis=1)
+        normal_high = np.nanpercentile(daily_values, 70, axis=1)
+    too_few = years_present < MIN_NORMAL_YEARS
+    if too_few.any():
+        logger.warning(
+            f"{int(too_few.sum())} days of the water year have fewer than "
+            f"{MIN_NORMAL_YEARS} years of data; normals left blank for those days."
+        )
+    normal_low[too_few] = np.nan
+    normal_high[too_few] = np.nan
 
     generic_wy_dates = pd.date_range(start="2022-10-01", periods=365, freq="D")
 
@@ -66,8 +80,17 @@ def calc_normal_values(dates: pd.DatetimeIndex, values_array: np.ndarray):
     low_map = low_series.set_axis(low_series.index.strftime("%m-%d"))
     high_map = high_series.set_axis(high_series.index.strftime("%m-%d"))
 
-    normal_low_series = df["map_key"].map(low_map).interpolate(method="time")
-    normal_high_series = df["map_key"].map(high_map).interpolate(method="time")
+    # Interpolate only the single Feb 29 gap; blank normals stay blank
+    normal_low_series = (
+        df["map_key"]
+        .map(low_map)
+        .interpolate(method="time", limit=1, limit_area="inside")
+    )
+    normal_high_series = (
+        df["map_key"]
+        .map(high_map)
+        .interpolate(method="time", limit=1, limit_area="inside")
+    )
 
     return normal_low_series, normal_high_series
 
@@ -85,7 +108,8 @@ def compute_rolling_precip_analysis(
     else:
         final_df = precip_series.copy()
 
-    rolling_30day = final_df.rolling(window=30, min_periods=1).sum()
+    # A 30-day total is only valid when all 30 days have data
+    rolling_30day = final_df.rolling(window=30, min_periods=30).sum()
 
     # Water year window for graphing (kept broad for context)
     wy_start = (
@@ -100,7 +124,8 @@ def compute_rolling_precip_analysis(
     norm_start = datetime(analysis_date.year - 31, 10, 1)
     norm_end = datetime(analysis_date.year - 1, 9, 30)
 
-    stats_rolling = rolling_30day[norm_start:norm_end].dropna()
+    # Keep NaN days so the water-year table stays aligned by calendar day
+    stats_rolling = rolling_30day[norm_start:norm_end]
 
     all_days_array = value_list_to_water_year_table(stats_rolling.index, stats_rolling)
     normal_low, normal_high = calc_normal_values(
@@ -164,7 +189,7 @@ def run_full_precip_analysis(
     else:
         precip_unit = "tenths_mm"
 
-    if precip_series.empty:
+    if precip_series.empty or precip_series.isna().all():
         logger.error("Failed to build precipitation series.")
         return {"error": "No precipitation data available"}
 
