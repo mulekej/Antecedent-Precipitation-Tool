@@ -80,19 +80,25 @@ def calc_normal_values(dates: pd.DatetimeIndex, values_array: np.ndarray):
     low_map = low_series.set_axis(low_series.index.strftime("%m-%d"))
     high_map = high_series.set_axis(high_series.index.strftime("%m-%d"))
 
-    # Interpolate only the single Feb 29 gap; blank normals stay blank
-    normal_low_series = (
-        df["map_key"]
-        .map(low_map)
-        .interpolate(method="time", limit=1, limit_area="inside")
-    )
-    normal_high_series = (
-        df["map_key"]
-        .map(high_map)
-        .interpolate(method="time", limit=1, limit_area="inside")
-    )
+    normal_low_series = _fill_leap_day(df["map_key"].map(low_map))
+    normal_high_series = _fill_leap_day(df["map_key"].map(high_map))
 
     return normal_low_series, normal_high_series
+
+
+def _fill_leap_day(series: pd.Series) -> pd.Series:
+    """Give Feb 29 the average of the Feb 28 and Mar 1 normals.
+
+    The normals table has no Feb 29, so it maps to NaN. Only those days are
+    filled; normals left blank for too few years of data stay blank.
+    """
+    leap = (series.index.month == 2) & (series.index.day == 29)
+    if leap.any():
+        one_day = pd.Timedelta(days=1)
+        before = series.reindex(series.index[leap] - one_day).to_numpy()
+        after = series.reindex(series.index[leap] + one_day).to_numpy()
+        series[leap] = (before + after) / 2
+    return series
 
 
 def compute_rolling_precip_analysis(
