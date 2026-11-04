@@ -101,15 +101,18 @@ def build_composite_precip_series_gridded(
     load_manifest()
     precip_series = get_gridded_precip_timeseries(lat, lon, start_date, end_date)
 
-    # Match data_downloader processing: reindex + interpolate + fillna(0)
+    # Match data_downloader processing: bridge single-day gaps only; longer gaps
+    # (e.g. failed monthly downloads) stay NaN instead of becoming zero precipitation
     if not precip_series.empty:
         date_range = pd.date_range(start=start_date, end=end_date, freq="D")
         precip_series = (
-            precip_series.reindex(date_range).interpolate(method="time").fillna(0)
+            precip_series.reindex(date_range).interpolate(
+                method="time", limit=1, limit_area="inside"
+            )
         )
     else:
         date_range = pd.date_range(start=start_date, end=end_date, freq="D")
-        precip_series = pd.Series(0.0, index=date_range, dtype="float64")
+        precip_series = pd.Series(float("nan"), index=date_range, dtype="float64")
 
     stations_info = [
         {

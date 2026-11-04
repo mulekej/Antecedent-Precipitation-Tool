@@ -44,34 +44,56 @@ def dict_to_series(d: Dict) -> pd.Series:
     return s
 
 
-def _compute_precip_condition(precip_data: Dict) -> (str, int):
-    """Recomputes the wetness result string and score from stored series."""
+INSUFFICIENT_DATA = "Insufficient Data"
+
+
+def _score_precip_periods(precip_data: Dict):
+    """Scores the three 30-day periods ending 0, 30 and 60 days before obs_date.
+
+    Returns (periods, condition, total_score). Each period is a dict with
+    date, low, high, obs, condition, value, weight and product. If any period
+    is missing its observed total or a normal bound, the result is
+    INSUFFICIENT_DATA with a score of None: missing data is unknown, not dry.
+    """
     rolling_total = dict_to_series(precip_data.get("rolling_total"))
     normal_low = dict_to_series(precip_data.get("normal_low"))
     normal_high = dict_to_series(precip_data.get("normal_high"))
 
-    if "obs_date" not in precip_data or not precip_data["obs_date"]:
-        return "Error", 0
-
     obs_date = datetime.strptime(precip_data["obs_date"], "%Y-%m-%d")
 
-    total_score = 0
+    periods = []
     for days_prior, weight in [(0, 3), (30, 2), (60, 1)]:
         p_date = obs_date - timedelta(days=days_prior)
         obs_val = rolling_total.get(p_date)
         low_val = normal_low.get(p_date)
         high_val = normal_high.get(p_date)
 
-        if any(pd.isna(v) or v is None for v in [obs_val, low_val, high_val]):
-            c_val = 0
+        if any(v is None or pd.isna(v) for v in [obs_val, low_val, high_val]):
+            condition, c_val = "Data Missing", None
         elif obs_val > high_val:
-            c_val = 3
+            condition, c_val = "Wet", 3
         elif obs_val < low_val:
-            c_val = 1
+            condition, c_val = "Dry", 1
         else:
-            c_val = 2
-        total_score += c_val * weight
+            condition, c_val = "Normal", 2
 
+        periods.append(
+            {
+                "date": p_date,
+                "low": None if low_val is None or pd.isna(low_val) else low_val,
+                "high": None if high_val is None or pd.isna(high_val) else high_val,
+                "obs": None if obs_val is None or pd.isna(obs_val) else obs_val,
+                "condition": condition,
+                "value": c_val,
+                "weight": weight,
+                "product": None if c_val is None else c_val * weight,
+            }
+        )
+
+    if any(p["value"] is None for p in periods):
+        return periods, INSUFFICIENT_DATA, None
+
+    total_score = sum(p["product"] for p in periods)
     if total_score < 10:
         condition = "Drier than Normal"
     elif total_score <= 14:
@@ -79,6 +101,15 @@ def _compute_precip_condition(precip_data: Dict) -> (str, int):
     else:
         condition = "Wetter than Normal"
 
+    return periods, condition, total_score
+
+
+def _compute_precip_condition(precip_data: Dict) -> (str, int):
+    """Recomputes the wetness result string and score from stored series."""
+    if "obs_date" not in precip_data or not precip_data["obs_date"]:
+        return "Error", 0
+
+    _, condition, total_score = _score_precip_periods(precip_data)
     return condition, total_score
 
 

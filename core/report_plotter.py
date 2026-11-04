@@ -21,7 +21,13 @@ from matplotlib import rcParams
 from matplotlib.backends.backend_pdf import PdfPages
 from pypdf import PdfWriter
 
-from core.data_handler import _compute_precip_condition, _coord_str, dict_to_series
+from core.data_handler import (
+    INSUFFICIENT_DATA,
+    _compute_precip_condition,
+    _coord_str,
+    _score_precip_periods,
+    dict_to_series,
+)
 
 logger = logging.getLogger(__name__)
 _CONDITION_COLORS = {
@@ -86,7 +92,7 @@ def _extract_meta(precip_files, usgs_data, nwm_data, lat, lon, analysis_date):
 def _condition_from_score(score):
     """Map antecedent total_score to label + RGB, matching precip page logic."""
     if score is None or (isinstance(score, float) and np.isnan(score)):
-        return "No Data", _WHITE
+        return INSUFFICIENT_DATA, _WHITE
     try:
         score = float(score)
     except (TypeError, ValueError):
@@ -192,6 +198,7 @@ def _aggregate_batch_stats(rows: list) -> Dict[str, Any]:
         "Normal Conditions": 0,
         "Wetter than Normal": 0,
     }
+    n_insufficient = 0
     table_vals = [["Lat", "Lon", "Date", "Score", "Condition", "Source"]]
     table_colors = [[_LIGHT_GREY] * 6]
 
@@ -205,6 +212,8 @@ def _aggregate_batch_stats(rows: list) -> Dict[str, Any]:
                 pass
         if condition in condition_counts:
             condition_counts[condition] += 1
+        elif score is None:
+            n_insufficient += 1
 
         color = _CONDITION_COLORS.get(condition, _WHITE)
         table_vals.append(
@@ -241,6 +250,7 @@ def _aggregate_batch_stats(rows: list) -> Dict[str, Any]:
         "table_colors": table_colors,
         "n_points": len(rows),
         "n_scored": len(scores),
+        "n_insufficient": n_insufficient,
     }
 
 
@@ -411,10 +421,10 @@ def _plot_precip_page(
     )
 
     # ---- Rain table ----
-    summary = precip_data.get("antecedent_score_summary", {})
-    result, total_score = summary.get("condition"), summary.get("total_score")
-    if result is None:
-        result, total_score = _compute_precip_condition(precip_data)
+    periods, result, total_score = _score_precip_periods(precip_data)
+
+    def _fmt(v):
+        return "—" if v is None else f"{v:.2f}"
 
     rain_table_vals = [
         [
@@ -429,30 +439,17 @@ def _plot_precip_page(
         ]
     ]
     rain_colors = [[light_grey] * 8]
-    for days_prior, weight in [(0, 3), (30, 2), (60, 1)]:
-        p_date = obs_date - timedelta(days=days_prior)
-        obs_val = rolling_total.get(p_date)
-        low_val = normal_low.get(p_date)
-        high_val = normal_high.get(p_date)
-        if any(pd.isna(v) or v is None for v in [obs_val, low_val, high_val]):
-            condition, c_val = "Data Missing", 0
-        elif obs_val > high_val:
-            condition, c_val = "Wet", 3
-        elif obs_val < low_val:
-            condition, c_val = "Dry", 1
-        else:
-            condition, c_val = "Normal", 2
-        prod = c_val * weight
+    for p in periods:
         rain_table_vals.append(
             [
-                p_date.strftime("%Y-%m-%d"),
-                f"{low_val:.2f}",
-                f"{high_val:.2f}",
-                f"{obs_val:.2f}",
-                condition,
-                c_val,
-                weight,
-                prod,
+                p["date"].strftime("%Y-%m-%d"),
+                _fmt(p["low"]),
+                _fmt(p["high"]),
+                _fmt(p["obs"]),
+                p["condition"],
+                "—" if p["value"] is None else p["value"],
+                p["weight"],
+                "—" if p["product"] is None else p["product"],
             ]
         )
         rain_colors.append([white] * 8)
@@ -462,9 +459,8 @@ def _plot_precip_page(
         "Normal Conditions": light_green,
         "Wetter than Normal": light_blue,
     }.get(result, white)
-    rain_table_vals.append(
-        ["Result", "", "", "", "", "", "", f"{result} - {total_score}"]
-    )
+    result_text = result if total_score is None else f"{result} - {total_score}"
+    rain_table_vals.append(["Result", "", "", "", "", "", "", result_text])
     rain_colors.append([white] * 7 + [final_color])
 
     t2 = ax2.table(
@@ -800,6 +796,7 @@ def _plot_batch_summary_page(
         ["Watershed Size", size_str],
         ["Sampling Points / Days", str(stats["n_points"])],
         ["With Valid Score", str(stats["n_scored"])],
+        ["Insufficient Data (not scored)", str(stats["n_insufficient"])],
     ]
     t2 = ax_intermediate.table(
         cellText=inter_vals,

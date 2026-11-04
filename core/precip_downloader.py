@@ -25,6 +25,11 @@ from config import get_base_url
 
 logger = logging.getLogger(__name__)
 
+# Nearest stations downloaded when choosing the primary station
+MAX_PRIMARY_CANDIDATES = 40
+# Extra station downloads allowed while filling gaps in the composite
+MAX_FILL_FETCHES = 60
+
 
 # ====================== ELEVATION ======================
 def get_elevation(lat: float, lon: float, unit: str = "feet") -> float:
@@ -87,16 +92,16 @@ def get_ghcn_timeseries_data(
     end_date = pd.to_datetime(end_date_str)
     today_str = datetime.now().strftime("%Y%m%d")
 
-    def _get_station_list():
-        # Apply 30-day cache check for the main stations list
-        pattern = os.path.join(cache_dir, "stations_*.txt")
+    def _get_cached_reference_file(prefix: str, url_key: str, line_filter=None):
+        """Download a GHCN reference file with a 30-day cache, returning its path."""
+        pattern = os.path.join(cache_dir, f"{prefix}_*.txt")
         existing_files = glob.glob(pattern)
         filepath = None
 
         if existing_files:
             existing_files.sort()
             filepath = existing_files[-1]
-            date_str = os.path.basename(filepath).split("_")[1].split(".")[0]
+            date_str = os.path.basename(filepath).split("_")[-1].split(".")[0]
             try:
                 file_date = datetime.strptime(date_str, "%Y%m%d")
                 if (datetime.now() - file_date).days > 30:
@@ -106,16 +111,20 @@ def get_ghcn_timeseries_data(
 
         if not filepath:
             try:
-                stations_url = get_base_url("ghcn_stations")
-                logger.info("Downloading GHCN station list...")
-                response = requests.get(stations_url, timeout=30)
+                url = get_base_url(url_key)
+                logger.info(f"Downloading {url}...")
+                response = requests.get(url, timeout=60)
                 response.raise_for_status()
 
-                new_filepath = os.path.join(cache_dir, f"stations_{today_str}.txt")
-                with open(new_filepath, "w") as f:
-                    f.write(response.text)
+                text = response.text
+                if line_filter is not None:
+                    text = "\n".join(l for l in text.splitlines() if line_filter(l))
 
-                # Delete superseded station files
+                new_filepath = os.path.join(cache_dir, f"{prefix}_{today_str}.txt")
+                with open(new_filepath, "w") as f:
+                    f.write(text)
+
+                # Delete superseded files
                 for old_file in existing_files:
                     try:
                         os.remove(old_file)
@@ -124,17 +133,31 @@ def get_ghcn_timeseries_data(
                 filepath = new_filepath
             except Exception as e:
                 if existing_files:
-                    logger.debug(f"Failed to download stations. Using stale cache. {e}")
+                    logger.debug(f"Failed to download {prefix}. Using stale cache. {e}")
                     filepath = existing_files[-1]
                 else:
                     raise e
 
+        return filepath
+
+    def _get_station_list():
+        filepath = _get_cached_reference_file("stations", "ghcn_stations")
         col_specs = [(0, 11), (12, 20), (21, 30), (31, 37), (38, 40), (41, 71)]
         names = ["id", "latitude", "longitude", "elevation", "state", "name"]
         df = pd.read_fwf(filepath, colspecs=col_specs, names=names, index_col="id")
         df["elevation"] = pd.to_numeric(df["elevation"], errors="coerce")
         logger.info(f"Loaded {len(df)} GHCN stations from cache/network.")
         return df
+
+    def _get_prcp_inventory():
+        """First/last year of PRCP record per station, from ghcnd-inventory.txt."""
+        filepath = _get_cached_reference_file(
+            "inventory_prcp", "ghcn_inventory", lambda l: l[31:35] == "PRCP"
+        )
+        col_specs = [(0, 11), (36, 40), (41, 45)]
+        names = ["id", "first_year", "last_year"]
+        df = pd.read_fwf(filepath, colspecs=col_specs, names=names, index_col="id")
+        return df[~df.index.duplicated()]
 
     def _parse_dly_file(file_content: str) -> pd.Series | None:
         """Optimized high-performance parser bypassing individual pd.to_datetime calls."""
@@ -418,8 +441,7 @@ def get_ghcn_timeseries_data(
                 "elevation_ft": station_elev_ft,
             }
         )
-    local_stations = sorted(local_stations, key=lambda x: x["weighted_diff"])[:40]
-    logger.info(f"Fetching data for {len(local_stations)} stations...")
+    local_stations = sorted(local_stations, key=lambda x: x["weighted_diff"])
 
     stations_with_data = []
     norm_start = start_date
@@ -427,7 +449,34 @@ def get_ghcn_timeseries_data(
     ante_start = end_date - timedelta(days=90)
     ante_end = end_date
 
+    # Attach PRCP period of record so stations can be chosen by coverage
+    # instead of distance alone. Dense networks (e.g. CoCoRaHS) otherwise
+    # crowd every long-record station out of the candidate pool.
+    try:
+        inventory = _get_prcp_inventory()
+    except Exception as e:
+        logger.warning(f"GHCN inventory unavailable, selecting by distance only: {e}")
+        inventory = None
     for st in local_stations:
+        if inventory is not None and st["id"] in inventory.index:
+            st["first_year"] = int(inventory.at[st["id"], "first_year"])
+            st["last_year"] = int(inventory.at[st["id"], "last_year"])
+        elif inventory is not None:
+            st["first_year"], st["last_year"] = None, None  # no PRCP record
+        else:
+            st["first_year"], st["last_year"] = start_date.year, end_date.year
+    local_stations = [
+        st
+        for st in local_stations
+        if st["first_year"] is not None
+        and st["first_year"] <= end_date.year
+        and st["last_year"] >= start_date.year
+    ]
+
+    def _covers_years(st, years) -> bool:
+        return any(st["first_year"] <= y <= st["last_year"] for y in years)
+
+    def _load(st):
         series = _fetch_station_data(st["id"])
         st["data"] = series
         if series is not None and not series.empty:
@@ -436,6 +485,28 @@ def get_ghcn_timeseries_data(
         else:
             st["actual_rows"] = 0
             st["antecedent_rows"] = 0
+
+    # Primary candidates: nearest stations whose record could plausibly meet
+    # the primary-station thresholds and that report during the antecedent period.
+    def _normal_years(st):
+        return max(
+            0,
+            min(st["last_year"], norm_end.year)
+            - max(st["first_year"], norm_start.year)
+            + 1,
+        )
+
+    primary_pool = [
+        st
+        for st in local_stations
+        if _normal_years(st) * 365 > 6000 and st["last_year"] >= ante_start.year
+    ][:MAX_PRIMARY_CANDIDATES]
+    if not primary_pool:
+        primary_pool = local_stations[:MAX_PRIMARY_CANDIDATES]
+    logger.info(f"Fetching data for {len(primary_pool)} primary candidates...")
+
+    for st in primary_pool:
+        _load(st)
         stations_with_data.append(st)
 
     primary = _get_primary_station(stations_with_data, end_date)
@@ -446,7 +517,7 @@ def get_ghcn_timeseries_data(
     logger.info(f"Selected primary: {primary['id']} / {primary.get('name')}")
 
     # Re-sort others relative to primary
-    other_stations = [s for s in stations_with_data if s["id"] != primary["id"]]
+    other_stations = [s for s in local_stations if s["id"] != primary["id"]]
     for st in other_stations:
         dist = great_circle(
             (primary["latitude"], primary["longitude"]),
@@ -463,10 +534,24 @@ def get_ghcn_timeseries_data(
     date_range = pd.date_range(start=start_date, end=end_date, freq="D")
     composite = pd.Series(index=date_range, dtype="float64")
     final_used = []
+    extra_fetches = 0
 
     for i, st in enumerate(sorted_stations):
-        if composite.isna().sum() == 0:
+        missing = composite.isna()
+        if not missing.any():
             break
+        # Skip stations whose record cannot fill any of the remaining gaps
+        if i > 0 and not _covers_years(st, set(composite.index[missing].year)):
+            continue
+        if "data" not in st:
+            if extra_fetches >= MAX_FILL_FETCHES:
+                logger.warning(
+                    f"Reached {MAX_FILL_FETCHES} additional station downloads "
+                    "with gaps remaining."
+                )
+                break
+            _load(st)
+            extra_fetches += 1
         data = st.get("data")
         if data is not None and not data.empty:
             before = composite.isna().sum()
@@ -485,7 +570,17 @@ def get_ghcn_timeseries_data(
                 )
                 final_used.append(st_info)
 
-    composite = composite.interpolate(method="time", limit_direction="both").fillna(0)
+    # Bridge single-day gaps only (as v3.0.9 did). Longer gaps stay NaN so they
+    # are excluded from the normals rather than counted as zero precipitation.
+    composite = composite.interpolate(method="time", limit=1, limit_area="inside")
+
+    remaining = composite.isna()
+    if remaining.any():
+        logger.warning(
+            f"{int(remaining.sum())} days have no station data after filling "
+            f"({int(remaining[norm_start:norm_end].sum())} in the normal period, "
+            f"{int(remaining[ante_start:ante_end].sum())} in the antecedent period)."
+        )
 
     logger.info(f"Composite built with {len(final_used)} stations")
     return composite, final_used, target_elev_ft or -1.0
@@ -530,9 +625,9 @@ def build_composite_precip_series(
         series = pd.Series(dtype="float64")
         stations_info = []
 
-    # Ensure full date range
+    # Ensure full date range; days without data stay NaN (never zero-filled)
     full_range = pd.date_range(start=start_date, end=end_date, freq="D")
-    series = series.reindex(full_range).fillna(0)
+    series = series.reindex(full_range)
 
     return (
         series,
